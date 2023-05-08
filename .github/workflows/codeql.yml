@@ -1,0 +1,60 @@
+name: C/C++ Build and Scan
+
+#https://github.com/filipdutescu/modern-cpp-template/blob/master/.github/workflows/release.yml
+
+on: 
+  #push:
+  workflow_dispatch:
+
+env:
+  name: "Windows Latest MSVC"
+  artifact_ext: '.zip'
+  os: 'windows-latest'
+  cc: "cl"
+  cxx: "cl"
+  environment_script: "C:/Program Files (x86)/Microsoft Visual Studio/2019/Enterprise/VC/Auxiliary/Build/vcvars64.bat"
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')"
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: cache dependencies
+      uses: actions/cache@v2
+      id: cache
+      with:
+        path: ${{ github.HOME }}/.local
+        key: ${{runner.os}}-dependencies
+    
+    # Python 3.8 or higher with the py launcher installed. --> actions/setup-python@v3
+    - name: Setup Dependencies
+      uses: actions/setup-python@v3
+      with:
+        version: 3.8
+    
+    # TODO
+    # PowerShell 7 or higher --> https://aka.ms/powershell-release?tag=stable
+    # Boost 1.71.0, extracted to a path defined by the environment variable BOOST_ROOT. --> https://boostorg.jfrog.io/artifactory/main/release/1.71.0/source/boost_1_71_0.7z
+    # MSYS2 at C:\msys64\ which is where the installer places it. --> https://www.msys2.org/
+    # Node.js and Yarn in your PATH as node and yarn. --> https://nodejs.org/en/download/ | https://classic.yarnpkg.com/en/docs/install/
+    
+    #https://github.com/citizenfx/fivem/blob/master/docs/building.md
+    - name: Setup Build Environment
+      if: ${{steps.cache.output.cache-hit != 'true'}}
+      run: |
+        set BOOST_ROOT=C:\libraries\boost_1_71_0
+        set PATH=C:\tools\python27amd64;%path%
+        git clone https://github.com/citizenfx/fivem.git -c core.symlinks=true
+        cd fivem
+        git submodule update --jobs=16 --init
+        fxd get-chrome
+        fxd gen -game five
+        fxd vs -game five
+    
+    # Optional:
+    #- name: Set up data files for five
+    # run: |
+    #   New-Item -ItemType SymbolicLink -Path "game-storage" -Target "$env:localappdata/FiveM/FiveM.app/data/game-storage"
