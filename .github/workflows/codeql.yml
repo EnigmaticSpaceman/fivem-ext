@@ -41,9 +41,46 @@ jobs:
     
     # TODO1
     # PowerShell 7 or higher --> https://aka.ms/powershell-release?tag=stable
+    # Should be default?
+    
     # Boost 1.71.0, extracted to a path defined by the environment variable BOOST_ROOT. --> https://boostorg.jfrog.io/artifactory/main/release/1.71.0/source/boost_1_71_0.7z
+    # https://github.com/MarkusJx/install-boost
+    - name: Setup Boost 1.71.0
+      uses: MarkusJx/install-boost@v2.4.4
+      id: install-boost
+      with:
+        # REQUIRED: Specify the required boost version
+        # A list of supported versions can be found here:
+        # https://github.com/MarkusJx/prebuilt-boost/blob/main/versions-manifest.json
+        boost_version: 1.71.0
+        # OPTIONAL: Specify a custon install location
+        boost_install_dir: C:\BOOST
+        # OPTIONAL: Specify a platform version
+        platform_version: 2019
+        # OPTIONAL: Specify a toolset
+        # toolset: msvc
+        
+    #https://stackoverflow.com/questions/61858388/how-do-i-set-an-enviroment-variable-in-github-action-on-a-windows-server
+    - name: Set Boost ENV var
+      run: |
+        chcp 65001
+        echo "BOOST_ROOT=C:\BOOST" >> $env:GITHUB_ENV
+        echo "boost root var: ${{ env.BOOST_ROOT }}"
+        
     # MSYS2 at C:\msys64\ which is where the installer places it. --> https://www.msys2.org/
+    # https://github.com/msys2/setup-msys2
+    - name: Setup msys2
+      uses: msys2/setup-msys2@v2
+    
     # Node.js and Yarn in your PATH as node and yarn. --> https://nodejs.org/en/download/ | https://classic.yarnpkg.com/en/docs/install/
+    - name: Setup npm
+      uses: actions/setup-node@main
+      #with:
+      #  node-version: 14.19.1
+    
+    - name: Setup Yarn
+      run: |
+        yarn install
     
     #https://github.com/citizenfx/fivem/blob/master/docs/building.md
     - name: Setup Build Environment
@@ -51,7 +88,7 @@ jobs:
       run: |
         set BOOST_ROOT=C:\libraries\boost_1_71_0
         set PATH=C:\tools\python27amd64;%path%
-        git clone https://github.com/citizenfx/fivem.git -c core.symlinks=true
+        # git clone https://github.com/citizenfx/fivem.git -c core.symlinks=true
         cd fivem
         git submodule update --jobs=16 --init
         fxd get-chrome
