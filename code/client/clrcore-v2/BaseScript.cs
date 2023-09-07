@@ -1,6 +1,6 @@
-using CitizenFX.Core.Native;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Reflection;
 using System.Security;
 
@@ -8,11 +8,32 @@ namespace CitizenFX.Core
 {
 	public abstract class BaseScript
 	{
-		#region Fields
+		[Flags]
+		internal enum State : byte
+		{
+			Uninitialized = 0x0,
+			Initialized = 0x1,
+			Enabled = 0x2,
+		}
 
-		private bool m_initialized = false;
+		#region Fields & Properties
+
+		private State m_state = State.Uninitialized;
+
+		public bool IsEnabled => (m_state & State.Enabled) != 0;
 
 		private readonly List<CoroutineRepeat> m_tickList = new List<CoroutineRepeat>();
+
+		/// <summary>
+		/// A method to be scheduled on every game tick, do note that they'll only be rescheduled for the next frame once the method returns.
+		/// </summary>
+		protected event Func<Coroutine> Tick
+		{
+			add => RegisterTick(value);
+			remove => UnregisterTick(value);
+		}
+
+		private readonly List<KeyValuePair<int, DynFunc>> m_commands = new List<KeyValuePair<int, DynFunc>>();
 
 #if REMOTE_FUNCTION_ENABLED
 		private readonly List<RemoteHandler> m_persistentFunctions = new List<RemoteHandler>();
@@ -23,20 +44,34 @@ namespace CitizenFX.Core
 
 		#endregion
 
-		#region Instance Initialization
+		#region Instance initialization, finalization, and enablement
 		~BaseScript()
 		{
-			for (int i = 0; i < m_tickList.Count; ++i)
-				m_tickList[i].Stop();
+			if (!AppDomain.CurrentDomain.IsFinalizingForUnload())
+			{
+				// remove all reserved command slots
+				for (int i = 0; i < m_commands.Count; ++i)
+				{
+					ReferenceFunctionManager.Remove(m_commands[i].Key);
+				}
+
+				m_commands.Clear(); // makes sure Disable() call below won't unnecessarily try to disable commands
+
+				Disable();
+			}
 		}
 
 		[SecuritySafeCritical]
 		internal void Initialize()
 		{
-			if (m_initialized)
+			if (m_state != State.Uninitialized
+#if IS_FXSERVER
+				|| this is ClientScript // shared-lib support: disallow client scripts to be loaded in server environments
+#else
+				|| this is ServerScript // shared-lib support: disallow server scripts to be loaded in client environments
+#endif
+				)
 				return;
-
-			m_initialized = true;
 
 			var scriptMethods = this.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance);
 			foreach (MethodInfo method in scriptMethods)
@@ -51,7 +86,7 @@ namespace CitizenFX.Core
 						switch (attribute)
 						{
 							case TickAttribute tick:
-								Tick += (Func<Coroutine>)method.CreateDelegate(typeof(Func<Coroutine>), this);
+								RegisterTick((Func<Coroutine>)method.CreateDelegate(typeof(Func<Coroutine>), this), tick.StopOnException);
 								break;
 
 							case EventHandlerAttribute eventHandler:
@@ -59,9 +94,13 @@ namespace CitizenFX.Core
 								break;
 
 							case CommandAttribute command:
-								Native.CoreNatives.RegisterCommand(command.Command, Func.Create(this, method), command.Restricted);
+								RegisterCommand(command.Command, Func.CreateCommand(this, method, command.RemapParameters), command.Restricted);
 								break;
-
+#if !IS_FXSERVER
+							case KeyMapAttribute keyMap:
+								RegisterKeyMap(keyMap.Command, keyMap.Description, keyMap.InputMapper, keyMap.InputParameter, Func.CreateCommand(this, method, keyMap.RemapParameters));
+								break;
+#endif
 							case ExportAttribute export:
 								Exports.Add(export.Export, Func.Create(this, method), export.Binding);
 								break;
@@ -73,46 +112,135 @@ namespace CitizenFX.Core
 					}
 				}
 			}
+
+			m_state = State.Initialized | State.Enabled;
 		}
+
+		/// <summary>
+		/// Enables all ticks, commands, events, and exports
+		/// </summary>
+		public void Enable()
+		{
+			if (m_state == State.Uninitialized)
+			{
+				Initialize();
+				OnEnable();
+			}
+			else if ((m_state & State.Enabled) == 0)
+			{
+				// ticks
+				for (int i = 0; i < m_tickList.Count; ++i)
+				{
+					m_tickList[i].Schedule();
+				}
+
+				// commands
+				for (int i = 0; i < m_commands.Count; ++i)
+				{
+					ReferenceFunctionManager.SetDelegate(m_commands[i].Key, m_commands[i].Value);
+				}
+
+				EventHandlers.Enable();
+				Exports.Enable();
+
+				m_state |= State.Enabled;
+
+				OnEnable();
+			}
+		}
+
+		/// <summary>
+		/// Disables all tick repeats, commands, events, and exports
+		/// </summary>
+		/// <remarks>
+		/// 1. This <see cref="BaseScript"/> can't re-enable itself except for callbacks, you may want to hold a reference to it.<br />
+		/// 2. External code/scripts can still call in for commands, but they'll get <see langword="null"/> returned automatically.
+		/// </remarks>
+		public void Disable()
+		{
+			if ((m_state & State.Enabled) != 0)
+			{
+				// ticks
+				for (int i = 0; i < m_tickList.Count; ++i)
+				{
+					m_tickList[i].Stop();
+				}
+
+				// commands
+				for (int i = 0; i < m_commands.Count; ++i)
+				{
+					ReferenceFunctionManager.SetDelegate(m_commands[i].Key, (_0, _1) => null);
+				}
+
+				EventHandlers.Disable();
+				Exports.Disable();
+
+				m_state &= ~State.Enabled;
+
+				OnDisable();
+			}
+		}
+
+		/// <summary>
+		/// Disables all tick repeats, commands, events, and exports
+		/// </summary>
+		/// <remarks>
+		/// 1. This <see cref="BaseScript"/> can't re-enable itself, unless <paramref name="deleteAllCallbacks"/> is <see langword="false" /> then callbacks are still able to, you may want to hold a reference to it.<br />
+		/// 2. External code/scripts can still call in for commands, but they'll get <see langword="null"/> returned automatically.
+		/// </remarks>
+		/// <param name="deleteAllCallbacks">If enabled will delete all callbacks targeting this <see cref="BaseScript"/> instance</param>
+		public void Disable(bool deleteAllCallbacks)
+		{
+			Disable(); // Remove commands' Target as well, so below `RemoveAllWithTarget` call won't delete those
+
+			if (deleteAllCallbacks)
+			{
+				ReferenceFunctionManager.RemoveAllWithTarget(this);
+			}
+		}
+
+		/// <summary>
+		/// Called when this script got enabled
+		/// </summary>
+		protected virtual void OnEnable() { }
+
+		/// <summary>
+		/// Called when this script got disabled
+		/// </summary>
+		protected virtual void OnDisable() { }
 
 		#endregion
 
 		#region Update/Tick Scheduling
 
-		/// <summary>
-		/// An event containing callbacks to attempt to schedule on every game tick.
-		/// A callback will only be rescheduled once the associated task completes.
-		/// </summary>
-		protected event Func<Coroutine> Tick
+		public void RegisterTick(Func<Coroutine> tick, bool stopOnException = false)
 		{
-			add
+			lock (m_tickList)
 			{
-				lock (m_tickList)
-				{
-					CoroutineRepeat newTick = new CoroutineRepeat(value);
-					m_tickList.Add(newTick);
-					newTick.Schedule();
-				}
+				CoroutineRepeat newTick = new CoroutineRepeat(tick, stopOnException);
+				m_tickList.Add(newTick);
+				newTick.Schedule();
 			}
-			remove
+		}
+
+		public void UnregisterTick(Func<Coroutine> tick)
+		{
+			lock (m_tickList)
 			{
-				lock (m_tickList)
+				for (int i = 0; i < m_tickList.Count; ++i)
 				{
-					int index = m_tickList.FindIndex(th => th.Equals(value));
-					if (index >= 0)
+					var stored = m_tickList[i];
+					if (stored.m_coroutine.Method == tick.Method && stored.m_coroutine.Target == tick.Target)
 					{
-						m_tickList[index].Stop();
-						m_tickList.RemoveAt(index);
+						stored.Stop();
+						m_tickList.RemoveAt(i);
+						break;
 					}
 				}
 			}
 		}
 
-		internal void RegisterTick(Func<Coroutine> tick) => Tick += tick;
-
-		private void StartCoroutine(Action action) => Scheduler.Schedule(action);
-
-		public static Coroutine WaitUntil(uint msecs) => Coroutine.WaitUntil(msecs);
+		public static Coroutine WaitUntil(TimePoint msecs) => Coroutine.WaitUntil(msecs);
 
 		public static Coroutine WaitUntilNextFrame() => Coroutine.Yield();
 
@@ -136,18 +264,45 @@ namespace CitizenFX.Core
 
 		#endregion
 
-		#region Events Handlers
+		#region Events & Command registration
 		internal void RegisterEventHandler(string eventName, DynFunc deleg, Binding binding = Binding.Local) => EventHandlers[eventName].Add(deleg, binding);
+		internal void UnregisterEventHandler(string eventName, DynFunc deleg) => EventHandlers[eventName].Remove(deleg);
+
+		internal void RegisterCommand(string command, DynFunc dynFunc, bool isRestricted = true)
+			=> m_commands.Add(new KeyValuePair<int, DynFunc>(ReferenceFunctionManager.CreateCommand(command, dynFunc, isRestricted), dynFunc));
+
+		internal void RegisterKeyMap(string command, string description, string inputMapper, string inputParameter, DynFunc dynFunc)
+		{
+#if IS_FXSERVER
+			throw new NotImplementedException();
+#else
+			if (inputMapper != null && inputParameter != null)
+			{
+				Debug.WriteLine(command);
+				Native.CoreNatives.RegisterKeyMapping(command, description, inputMapper, inputParameter);
+			}
+			m_commands.Add(new KeyValuePair<int, DynFunc>(ReferenceFunctionManager.CreateCommand(command, dynFunc, false), dynFunc));
+#endif
+		}
+
 		#endregion
 
 		#region Script loading
 
+		/// <summary>
+		/// Activates all ticks, events, and exports.
+		/// </summary>
+		/// <param name="script">script to activate</param>
 		public static void RegisterScript(BaseScript script)
 		{
 			ScriptManager.AddScript(script);
 		}
 
-		public static void UnregisterScript(in BaseScript script)
+		/// <summary>
+		/// Deactivates all ticks, events, and exports.
+		/// </summary>
+		/// <param name="script">script to deactivate</param>
+		public static void UnregisterScript(BaseScript script)
 		{
 			ScriptManager.RemoveScript(script);
 		}
@@ -178,9 +333,17 @@ namespace CitizenFX.Core
 #endif
 	}
 
-#if !IS_FXSERVER
-	public abstract class ClientScript : BaseScript { }
-#else
-	public abstract class ServerScript : BaseScript { }
+	/// <inheritdoc cref="BaseScript"/>
+	/// <remarks>Will and can only be activated in client environments</remarks>
+#if IS_FXSERVER
+	[EditorBrowsable(EditorBrowsableState.Never)]
 #endif
+	public abstract class ClientScript : BaseScript { }
+
+	/// <inheritdoc cref="BaseScript"/>
+	/// <remarks>Will and can only be activated in server environments</remarks>
+#if !IS_FXSERVER
+	[EditorBrowsable(EditorBrowsableState.Never)]
+#endif
+	public abstract class ServerScript : BaseScript { }
 }

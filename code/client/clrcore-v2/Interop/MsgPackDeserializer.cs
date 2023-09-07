@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Dynamic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security;
@@ -9,6 +10,7 @@ namespace CitizenFX.Core
 	public delegate Coroutine<object> Callback(params object[] args);
 
 	// Can be a struct as it's merely used for for temporary storage
+	[SecuritySafeCritical]
 	internal struct MsgPackDeserializer
 	{
 		private unsafe byte* m_ptr;
@@ -160,9 +162,9 @@ namespace CitizenFX.Core
 			throw new InvalidOperationException($"Tried to decode invalid MsgPack type {type}");
 		}
 
-		private Dictionary<string, object> ReadMap(uint length)
+		private IDictionary<string, object> ReadMap(uint length)
 		{
-			var retobject = new Dictionary<string, object>();
+			var retobject = new ExpandoObject() as IDictionary<string, object>;
 
 			for (var i = 0; i < length; i++)
 			{
@@ -174,6 +176,7 @@ namespace CitizenFX.Core
 
 			return retobject;
 		}
+
 		private unsafe byte[] ReadBytes(uint length)
 		{
 			var ptr = (IntPtr)AdvancePointer(length);
@@ -202,10 +205,26 @@ namespace CitizenFX.Core
 			return *(float*)&v;
 		}
 
+		/// <summary>
+		/// Read a <see cref="Single"/> stored as little endian, used for custom vectors
+		/// </summary>
+		private unsafe float ReadSingleLE()
+		{
+			uint v = *(uint*)AdvancePointer(4);
+
+			if (!BitConverter.IsLittleEndian)
+			{
+				v = (v >> 16) | (v << 16); // swap adjacent 16-bit blocks
+				v = ((v & 0xFF00FF00u) >> 8) | ((v & 0x00FF00FFu) << 8); // swap adjacent 8-bit blocks
+			}
+
+			return *(float*)&v;
+		}
+
 		private unsafe double ReadDouble()
 		{
 			var v = ReadUInt64();
-			return *(float*)&v;
+			return *(double*)&v;
 		}
 
 		private unsafe byte ReadByte()
@@ -281,21 +300,22 @@ namespace CitizenFX.Core
 			{
 				case 10: // remote funcref
 				case 11: // local funcref
+					var refFunc = ReadString(length);
 					return m_netSource is null
-						? _LocalFunction.Create(ReadString(length))
+						? _LocalFunction.Create(refFunc)
 #if REMOTE_FUNCTION_ENABLED
-						: _RemoteFunction.Create(ReadString(length), m_netSource);
+						: _RemoteFunction.Create(refFunc, m_netSource);
 #else
 						: null;
 #endif
 				case 20: // vector2
-					return new Vector2(ReadSingle(), ReadSingle());
+					return new Vector2(ReadSingleLE(), ReadSingleLE());
 				case 21: // vector3
-					return new Vector3(ReadSingle(), ReadSingle(), ReadSingle());
+					return new Vector3(ReadSingleLE(), ReadSingleLE(), ReadSingleLE());
 				case 22: // vector4
-					return new Vector4(ReadSingle(), ReadSingle(), ReadSingle(), ReadSingle());
+					return new Vector4(ReadSingleLE(), ReadSingleLE(), ReadSingleLE(), ReadSingleLE());
 				case 23: // quaternion
-					return new Quaternion(ReadSingle(), ReadSingle(), ReadSingle(), ReadSingle());
+					return new Quaternion(ReadSingleLE(), ReadSingleLE(), ReadSingleLE(), ReadSingleLE());
 				default: // shouldn't ever happen due to the check above
 					throw new InvalidOperationException($"Extension type {extType} not supported.");
 			}
@@ -307,7 +327,10 @@ namespace CitizenFX.Core
 			byte* curPtr = m_ptr;
 			m_ptr += amount;
 			if (m_ptr > m_end)
-				throw new ArgumentException($"msgpack deserializer tried to retrieve 8 bytes, {m_end - m_ptr} bytes remained");
+			{
+				m_ptr -= amount; // reverse damage
+				throw new ArgumentException($"MsgPackDeserializer tried to retrieve {amount} bytes while only {m_end - m_ptr} bytes remain");
+			}
 
 			return curPtr;
 		}

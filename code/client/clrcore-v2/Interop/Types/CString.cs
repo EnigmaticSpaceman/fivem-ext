@@ -1,5 +1,4 @@
 using System;
-using System.Collections;
 using System.Linq;
 using System.Security;
 using System.Runtime.InteropServices;
@@ -12,6 +11,7 @@ namespace CitizenFX.Core
 	/// </summary>
 	/// <remarks>In general don't use this type where you would normally use <see cref="string"/> in your .NET code, it needs to do conversion between UTF16 and UTF8 and is therefore slower.
 	/// This type and its conversions are more performant in regards to interop with native code (C++), and other runtimes, for these cases you may want to use this.</remarks>
+	[SecuritySafeCritical]
 	public sealed class CString : IComparable, IComparable<CString>, ICloneable, IEquatable<CString>/*, IConvertible, IEnumerable, IEnumerable<byte>*/
 	{
 		// Notes while working on this type:
@@ -21,6 +21,11 @@ namespace CitizenFX.Core
 		// Performance notes:
 		// 1. This type showed a speed increase of ~43% to ~47% when using strings while interfacing with C++ code,
 		// 2. Moving most methods to C++ and using InternalCall proved to be 1/3 slower, unless we build it into the runtime directly like `string`, which we highly unlikely do.
+
+		/// <summary>
+		/// An empty <see cref="CString"/> equivalent to <see cref="string.Empty"/>, null terminated for interop.
+		/// </summary>				
+		public static CString Empty { get; } = new CString(new byte[] { 0x0 });
 
 		[NonSerialized] internal readonly byte[] value;
 
@@ -90,7 +95,8 @@ namespace CitizenFX.Core
 			return null;
 		}
 
-		public object Clone() => new CString(value.ToArray());
+		[SecuritySafeCritical]
+		public object Clone() => new CString((byte[])value.Clone());
 
 		#endregion
 
@@ -153,7 +159,7 @@ namespace CitizenFX.Core
 		/// <param name="startIndex">start character index</param>
 		/// <returns>CString with the requested part of characters of this string</returns>
 		/// <exception cref="ArgumentOutOfRangeException"><paramref name="startIndex"/> &lt; 0 or &gt;= Length</exception>
-		public CString SubString(int startIndex) => SubString(unchecked((uint)startIndex));
+		public CString Substring(int startIndex) => Substring(unchecked((uint)startIndex));
 
 		/// <summary>
 		/// Retrieves a substring from this instance. The substring starts at a specified character position.
@@ -162,7 +168,9 @@ namespace CitizenFX.Core
 		/// <param name="startIndex">start character index</param>
 		/// <returns>CString with the requested part of characters of this string</returns>
 		/// <exception cref="ArgumentOutOfRangeException"><paramref name="startIndex"/> &lt; 0 or &gt;= Length</exception>
-		public CString SubString(uint startIndex)
+
+		[SecuritySafeCritical]
+		public CString Substring(uint startIndex)
 		{
 			uint maxLength = (uint)Length;
 			if (startIndex < maxLength)
@@ -195,12 +203,14 @@ namespace CitizenFX.Core
 		/// <param name="length">amount of characters we want in total, can be less.</param>
 		/// <returns>CString with the requested part of characters of this string</returns>
 		/// <exception cref="ArgumentOutOfRangeException"><paramref name="startIndex"/> &lt; 0 or &gt;= Length</exception>
+
+		[SecuritySafeCritical]
 		public CString Substring(uint startIndex, uint length)
 		{
 			uint maxLength = (uint)Length;
 			if (startIndex < maxLength)
 			{
-				uint copyLength = Math.Min(startIndex + length, maxLength);
+				uint copyLength = Math.Min(length, maxLength - startIndex);
 
 				byte[] bytes = new byte[copyLength + 1];
 				Buffer.BlockCopy(value, (int)startIndex, bytes, 0, (int)copyLength);
@@ -211,6 +221,41 @@ namespace CitizenFX.Core
 			throw new ArgumentOutOfRangeException();
 		}
 
+		/// <summary>
+		/// Joins/merges all given strings
+		/// </summary>
+		/// <param name="strings">Strings to join</param>
+		/// <returns><see cref="CString"/> containing all given strings concatenated</returns>
+		[SecuritySafeCritical]
+		public static CString Concat(CString[] strings)
+		{
+			if (strings != null)
+			{
+				int size = 1; // null terminator
+				for (int i = 0; i < strings.Length; ++i)
+				{
+					size += strings[i].Length;
+				}
+
+				byte[] array = new byte[size];
+				int offset = 0;
+
+				for (int i = 0; i < strings.Length; ++i)
+				{
+					var src = strings[i];
+
+					size = src.Length;
+					Buffer.BlockCopy(src.value, 0, array, offset, size);
+					offset += size;
+				}
+
+				return new CString(array);
+			}
+
+			return null;
+		}
+
+		[SecuritySafeCritical]
 		public static CString operator +(CString left, CString right)
 		{
 			if (left.value != null)
@@ -236,6 +281,7 @@ namespace CitizenFX.Core
 
 		#region Comparison
 
+		[SecuritySafeCritical]
 		public static unsafe bool operator ==(CString left, CString right)
 		{
 			if (left == right)
@@ -244,6 +290,7 @@ namespace CitizenFX.Core
 				return left.value.SequenceEqual(right.value);
 		}
 
+		[SecuritySafeCritical]
 		public static unsafe bool operator !=(CString left, CString right)
 		{
 			if (left != right)
@@ -254,6 +301,8 @@ namespace CitizenFX.Core
 
 		public static bool IsNullOrEmpty(CString str) => !(str?.value.Length != 1);
 		public override bool Equals(object obj) => obj is CString str && value.Equals(str.value);
+
+		[SecuritySafeCritical]
 		public bool Equals(CString other) => this == other || value.Equals(other.value);
 
 		public int CompareTo(object obj) => obj is CString str ? CompareTo(str) : 0;
@@ -300,6 +349,13 @@ namespace CitizenFX.Core
 		/// <param name="str">null-terminated c-string</param>
 		public static explicit operator string(CString str) => str?.ToString();
 
+		/// <summary>
+		/// Copy <see cref="OutString"/> into a null-terminated c-string
+		/// </summary>
+		/// <param name="str">OutString to copy</param>
+		/// <!-- Does put a dependency on OutString -->
+		public static implicit operator CString(OutString str) => str.ToCString();
+
 		#endregion
 
 		#region ASCII operations
@@ -310,7 +366,7 @@ namespace CitizenFX.Core
 		/// </summary>
 		/// <param name="str">string to compare</param>
 		/// <returns>true if both sides have equivalent characters in the ASCII character space</returns>
-		public unsafe bool CompareASCII(string str)
+		public bool CompareASCII(string str)
 		{
 			return CompareASCII(this, str);
 		}
@@ -322,6 +378,7 @@ namespace CitizenFX.Core
 		/// <param name="left">CString to compare</param>
 		/// <param name="right">string to compare</param>
 		/// <returns>true if both sides have equivalent characters in the ASCII character space</returns>
+		[SecuritySafeCritical]
 		public static unsafe bool CompareASCII(CString left, string right)
 		{
 			if (left == null && right == null)
@@ -352,6 +409,7 @@ namespace CitizenFX.Core
 		/// <param name="str">string to convert</param>
 		/// <param name="invalid">character to insert in case of a non-7 bit character</param>
 		/// <returns>CString with only ASCII (7 bit) characters, or null if <paramref name="str"/> == null</returns>
+		[SecuritySafeCritical]
 		public static unsafe CString ToASCII(string str, byte invalid = (byte)'?')
 		{
 			fixed (char* src = str)
@@ -375,6 +433,7 @@ namespace CitizenFX.Core
 
 		#region Encoding algorithms
 
+		[SecuritySafeCritical]
 		public override unsafe int GetHashCode()
 		{
 			fixed (byte* pin = value)

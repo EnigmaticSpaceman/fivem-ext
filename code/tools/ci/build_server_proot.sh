@@ -10,7 +10,7 @@ apk add curl git xz sudo rsync openssh-client binutils
 git config --global safe.directory '*'
 
 # announce building
-text="Woop, building a new $CI_PROJECT_NAME $CI_BUILD_REF_NAME SERVER/LINUX-PROOT build, triggered by $GITLAB_USER_EMAIL"
+text="Woop, building a new $CI_PROJECT_NAME $CI_COMMIT_REF_NAME SERVER/LINUX-PROOT build, triggered by $GITLAB_USER_EMAIL"
 
 escapedText=$(echo $text | sed 's/"/\"/g' | sed "s/'/\'/g" )
 json="{\"text\":\"$escapedText\"}"
@@ -25,7 +25,7 @@ cd ..
 
 # clone fivem-private
 if [ ! -d fivem-private ]; then
-	git clone $FIVEM_PRIVATE_URI -b master-old
+	git clone $FIVEM_PRIVATE_URI -b master
 else
 	cd fivem-private
 	git fetch origin
@@ -53,7 +53,7 @@ cd alpine
 tar xf ../alpine-minirootfs-3.16.5-x86_64.tar.gz
 cd ..
 
-export CI_BRANCH=$CI_BUILD_REF_NAME
+export CI_BRANCH=$CI_COMMIT_REF_NAME
 export CI_BUILD_NUMBER='v1.0.0.'$CI_PIPELINE_ID
 
 # change ownership of the build root

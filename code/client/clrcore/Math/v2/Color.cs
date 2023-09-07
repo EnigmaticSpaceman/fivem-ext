@@ -96,6 +96,9 @@ namespace CitizenFX.Core
 #endif
 		}
 
+		public static unsafe explicit operator Color(uint color) => new Color(color);
+		public static unsafe explicit operator Color(int color) => new Color(color);
+
 		public static unsafe explicit operator uint(in Color color) => color.argb[0];
 		public static unsafe explicit operator int(in Color color) => (int)color.argb[0];
 
@@ -115,7 +118,7 @@ namespace CitizenFX.Core
 		internal unsafe int ToArgb() { fixed(uint* p = argb) return (int)p[0]; }
 #endif
 
-		public override string ToString() => $"Color({R}, {G}, {B}, {A})";
+		public override string ToString() => $"Color({A}, {R}, {G}, {B})";
 
 		public unsafe bool Equals(Color other) => (uint)this == (uint)other;
 	}

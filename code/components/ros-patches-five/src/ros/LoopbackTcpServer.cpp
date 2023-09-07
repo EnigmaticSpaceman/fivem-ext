@@ -1479,6 +1479,7 @@ void BackOffMtl()
 }
 
 void RunLauncher(const wchar_t* toolName, bool instantWait);
+extern bool InLegitimacyUI();
 
 static void SetLauncherWaitCB(HANDLE hEvent, HANDLE hProcessIn, BOOL doBreak, DWORD timeout = INFINITE)
 {
@@ -1505,6 +1506,12 @@ static void SetLauncherWaitCB(HANDLE hEvent, HANDLE hProcessIn, BOOL doBreak, DW
 		{
 			HANDLE waitHandles[] = { hEvent, hProcess };
 			DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, 5000);
+
+			// if we've currently got the LegitimacyNui bits opened, bump the timeout
+			if (InLegitimacyUI())
+			{
+				endTime = GetTickCount64() + timeout;
+			}
 
 			if (waitResult == WAIT_OBJECT_0 + 1)
 			{
@@ -1820,7 +1827,10 @@ static HANDLE __stdcall CreateFileAStub(
 	{
 		lpFileName = va("\\\\.\\pipe\\MTLService_Pipe_CFX%s", IsCL2() ? "_CL2" : "");
 	}
-
+	else if (strcmp(lpFileName, "\\\\.\\pipe\\MTLLauncher_Pipe") == 0)
+	{
+		lpFileName = va("\\\\.\\pipe\\MTLLauncher_Pipe_CFX%s", IsCL2() ? "_CL2" : "");
+	}
 	
 	return g_oldCreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
 }
@@ -1830,6 +1840,10 @@ HANDLE _stdcall CreateNamedPipeAHookL(_In_ LPCSTR lpName, _In_ DWORD dwOpenMode,
 	if (strcmp(lpName, PIPE_NAME_NARROW) == 0)
 	{
 		lpName = va("%s%s", lpName, IsCL2() ? "_CL2" : "");
+	}
+	else if (strstr(lpName, "MTLLauncher"))
+	{
+		lpName = va("\\\\.\\pipe\\MTLLauncher_Pipe_CFX%s", IsCL2() ? "_CL2" : "");
 	}
 
 	return CreateNamedPipeA(lpName, dwOpenMode, dwPipeMode, nMaxInstances, nOutBufferSize, nInBufferSize, nDefaultTimeOut, lpSecurityAttributes);

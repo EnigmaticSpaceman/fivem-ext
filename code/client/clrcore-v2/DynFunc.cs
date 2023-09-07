@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -14,8 +15,12 @@ namespace CitizenFX.Core
 {
 	public delegate object DynFunc(Remote remote, params object[] arguments);
 
+	[SecuritySafeCritical]
 	public static class Func
 	{
+		private static readonly Dictionary<MethodInfo, MethodInfo> s_wrappedMethods = new Dictionary<MethodInfo, MethodInfo>();
+		private static readonly Dictionary<MethodInfo, MethodInfo> s_dynfuncMethods = new Dictionary<MethodInfo, MethodInfo>();
+
 		/// <summary>
 		/// Creates a new dynamic invokable function
 		/// </summary>
@@ -98,8 +103,17 @@ namespace CitizenFX.Core
 		public static DynFunc Create(DynFunc deleg) => deleg;
 
 		[SecurityCritical]
+		internal static DynFunc CreateCommand(object target, MethodInfo method, bool remap)
+			=> remap ? ConstructCommandRemapped(target, method) : Construct(target, method);
+
+		[SecurityCritical]
 		private static DynFunc Construct(object target, MethodInfo method)
 		{
+			if (s_wrappedMethods.TryGetValue(method, out var existingMethod))
+			{
+				return (DynFunc)existingMethod.CreateDelegate(typeof(DynFunc), target);
+			}
+
 			// TODO: implement optional parameter(s) support with parameter.IsOptional and parameter.DefaultValue
 
 			ParameterInfo[] parameters = method.GetParameters();
@@ -122,6 +136,7 @@ namespace CitizenFX.Core
 			}
 			else
 			{
+				target = null;
 				ldarg_remote = OpCodes.Ldarg_0;
 				ldarg_args = OpCodes.Ldarg_1;
 			}
@@ -130,20 +145,42 @@ namespace CitizenFX.Core
 			{
 				var parameter = parameters[i];
 				var t = parameter.ParameterType;
+
 #if DYN_FUNC_CALLI
 				parameterTypes[i] = t;
 #endif
-				if (t == typeof(Remote))
+				if (Attribute.IsDefined(parameter, typeof(SourceAttribute), true))
 				{
-					g.Emit(ldarg_remote);
-					continue;
+					if (t == typeof(Remote))
+					{
+						g.Emit(ldarg_remote);
+						continue;
+					}
+					else if (t == typeof(bool))
+					{
+						g.Emit(ldarg_remote);
+						g.Emit(OpCodes.Call, ((Func<Remote, bool>)Remote.IsRemoteInternal).Method);
+						continue;
+					}
+					else
+					{
+						var constructor = t.GetConstructor(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(Remote) }, null);
+						if (constructor != null)
+						{
+							g.Emit(ldarg_remote);
+							g.Emit(OpCodes.Newobj, constructor);
+							continue;
+						}
+					}
+					
+					throw new ArgumentException($"{nameof(SourceAttribute)} used on type {t}, this type can't be constructed with parameter Remote.");
 				}
 
 				g.Emit(ldarg_args);
 				g.Emit(OpCodes.Ldc_I4_S, (byte)p++);
 				g.Emit(OpCodes.Ldelem_Ref);
 
-				if (t.IsPrimitive)
+				if (t.IsValueType)
 				{
 					Label diff = g.DefineLabel();
 					Label done = g.DefineLabel();
@@ -160,7 +197,15 @@ namespace CitizenFX.Core
 
 					// not the same type, try and convert it
 					g.MarkLabel(diff);
-					g.Emit(OpCodes.Call, convertMethods[t]); // already handles null
+					if (t.IsPrimitive)
+					{
+						g.Emit(OpCodes.Call, convertMethods[t]); // already handles null
+					}
+					else
+					{
+						g.Emit(OpCodes.Pop);
+						g.Emit(OpCodes.Ldloc_S, g.DeclareLocal(t));
+					}
 
 					g.MarkLabel(done);
 				}
@@ -185,47 +230,186 @@ namespace CitizenFX.Core
 
 			g.Emit(OpCodes.Ret);
 
-			return (DynFunc)lambda.CreateDelegate(typeof(DynFunc), target);
+			Delegate dynFunc = lambda.CreateDelegate(typeof(DynFunc), target);
+
+			s_wrappedMethods.Add(method, dynFunc.Method);
+			s_dynfuncMethods.Add(dynFunc.Method, method);
+
+			return (DynFunc)dynFunc;
+		}
+
+		/// <summary>
+		/// If enabled creates a <see cref="DynFunc"/> that remaps input (<see cref="ushort"/> source, <see cref="object"/>[] arguments, <see cref="string"/> raw) to known types:<br />
+		/// <b>source</b>: <see cref="ushort"/>, <see cref="uint"/>, <see cref="int"/>, <see cref="bool"/>, <see cref="Remote"/>, or any type constructable from <see cref="Remote"/> including Player types.<br />
+		/// <b>arguments</b>: <see cref="object"/>[] or <see cref="string"/>[].<br />
+		/// <b>raw</b>: <see cref="string"/>
+		/// </summary>
+		/// <param name="target">Method's associated instance</param>
+		/// <param name="method">Method to wrap</param>
+		/// <returns>Dynamic invocable <see cref="DynFunc"/> with remapping and conversion support.</returns>
+		/// <exception cref="ArgumentException">When <see cref="SourceAttribute"/> is used on a non supported type.</exception>
+		/// <exception cref="TargetParameterCountException">When any requested parameter isn't supported.</exception>
+		[SecurityCritical]
+		private static DynFunc ConstructCommandRemapped(object target, MethodInfo method)
+		{
+			if (s_wrappedMethods.TryGetValue(method, out var existingMethod))
+			{
+				return (DynFunc)existingMethod.CreateDelegate(typeof(DynFunc), target);
+			}
+
+			ParameterInfo[] parameters = method.GetParameters();
+#if DYN_FUNC_CALLI
+			Type[] parameterTypes = new Type[parameters.Length];
+#endif
+			bool hasThis = (method.CallingConvention & CallingConventions.HasThis) != 0;
+
+			var lambda = new DynamicMethod($"{method.DeclaringType.FullName}.{method.Name}", typeof(object),
+				hasThis ? new[] { typeof(object), typeof(Remote), typeof(object[]) } : new[] { typeof(Remote), typeof(object[]) });
+
+			ILGenerator g = lambda.GetILGenerator();
+
+			OpCode ldarg_args;
+			if (hasThis)
+			{
+				g.Emit(OpCodes.Ldarg_0);
+				ldarg_args = OpCodes.Ldarg_2;
+			}
+			else
+			{
+				target = null;
+				ldarg_args = OpCodes.Ldarg_1;
+			}
+
+			for (int i = 0; i < parameters.Length; ++i)
+			{
+				var parameter = parameters[i];
+				var t = parameter.ParameterType;
+
+#if DYN_FUNC_CALLI
+				parameterTypes[i] = t;
+#endif
+				if (Attribute.IsDefined(parameter, typeof(SourceAttribute), true)) // source
+				{
+					g.Emit(ldarg_args);
+					g.Emit(OpCodes.Ldc_I4_0);
+					g.Emit(OpCodes.Ldelem_Ref);
+					g.Emit(OpCodes.Call, GetMethodInfo<object, ushort>(Convert.ToUInt16));
+
+					if (t.IsPrimitive)
+					{
+						if (t == typeof(int) || t == typeof(uint) || t == typeof(ushort))
+						{
+							// 16 bit integers are pushed onto the evaluation stack as 32 bit integers
+							continue;
+						}
+						else if (t == typeof(bool))
+						{
+							g.Emit(OpCodes.Ldc_I4_0);
+							g.Emit(OpCodes.Cgt_Un);
+							continue;
+						}
+					}
+					else if (t == typeof(Remote))
+					{
+						g.Emit(OpCodes.Call, ((Func<ushort, Remote>)Remote.Create).Method);
+						continue;
+					}
+					else
+					{
+						var constructor = t.GetConstructor(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(Remote) }, null);
+						if (constructor != null)
+						{
+							g.Emit(OpCodes.Call, ((Func<ushort, Remote>)Remote.Create).Method);
+							g.Emit(OpCodes.Newobj, constructor);
+							continue;
+						}
+					}
+
+					throw new ArgumentException($"{nameof(SourceAttribute)} used on type {t}, this type can't be constructed with parameter Remote.");
+				}
+				else if (t == typeof(object[])) // arguments; simply pass it on 
+				{
+					g.Emit(ldarg_args);
+					g.Emit(OpCodes.Ldc_I4_S, 1);
+					g.Emit(OpCodes.Ldelem_Ref);
+				}
+				else if (t == typeof(string[])) // arguments; convert to string[]
+				{
+					g.Emit(ldarg_args);
+					g.Emit(OpCodes.Ldc_I4_S, 1);
+					g.Emit(OpCodes.Ldelem_Ref);
+					g.EmitCall(OpCodes.Call, ((Func<object[], string[]>)ConvertToStringArray).Method, null);
+				}
+				else if (t == typeof(string)) // raw data; simply pass it on
+				{
+					g.Emit(ldarg_args);
+					g.Emit(OpCodes.Ldc_I4_S, 2);
+					g.Emit(OpCodes.Ldelem_Ref);
+				}
+				else
+					throw new TargetParameterCountException($"Command can't be registered with requested remapping, type {t} is not supported.");
+			}
+
+#if DYN_FUNC_CALLI
+			g.Emit(OpCodes.Ldc_I8, (long)method.MethodHandle.GetFunctionPointer());
+			g.EmitCalli(OpCodes.Calli, method.CallingConvention, method.ReturnType, parameterTypes, null);
+#else
+			g.EmitCall(OpCodes.Call, method, null);
+#endif
+
+			if (method.ReturnType == typeof(void))
+				g.Emit(OpCodes.Ldnull);
+			else
+				g.Emit(OpCodes.Box, method.ReturnType);
+
+			g.Emit(OpCodes.Ret);
+
+			Delegate dynFunc = lambda.CreateDelegate(typeof(DynFunc), target);
+
+			s_wrappedMethods.Add(method, dynFunc.Method);
+			s_dynfuncMethods.Add(dynFunc.Method, method);
+
+			return (DynFunc)dynFunc;
 		}
 
 		#region Func<,> creators, C# why?!
-		public static DynFunc Create<Ret>(Func<Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, Ret>(Func<A, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, Ret>(Func<A, B, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, Ret>(Func<A, B, C, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, Ret>(Func<A, B, C, D, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, Ret>(Func<A, B, C, D, E, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, Ret>(Func<A, B, C, D, E, F, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, Ret>(Func<A, B, C, D, E, F, G, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, Ret>(Func<A, B, C, D, E, F, G, H, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, Ret>(Func<A, B, C, D, E, F, G, H, I, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, Ret>(Func<A, B, C, D, E, F, G, H, I, J, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, M, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, M, N, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, Ret> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<Ret>(Func<Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, Ret>(Func<A, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, Ret>(Func<A, B, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, Ret>(Func<A, B, C, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, Ret>(Func<A, B, C, D, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, Ret>(Func<A, B, C, D, E, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, Ret>(Func<A, B, C, D, E, F, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, Ret>(Func<A, B, C, D, E, F, G, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, Ret>(Func<A, B, C, D, E, F, G, H, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, Ret>(Func<A, B, C, D, E, F, G, H, I, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, Ret>(Func<A, B, C, D, E, F, G, H, I, J, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, M, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, M, N, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, Ret> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Ret>(Func<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Ret> method) => Create(method.Target, method.Method);
 		#endregion
 
 		#region Action<> creators, C# again, why?!
-		public static DynFunc Create(Action method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A>(Action<A> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B>(Action<A, B> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C>(Action<A, B, C> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D>(Action<A, B, C, D> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E>(Action<A, B, C, D, E> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F>(Action<A, B, C, D, E, F> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G>(Action<A, B, C, D, E, F, G> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H>(Action<A, B, C, D, E, F, G, H> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I>(Action<A, B, C, D, E, F, G, H, I> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J>(Action<A, B, C, D, E, F, G, H, I, J> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K>(Action<A, B, C, D, E, F, G, H, I, J, K> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L>(Action<A, B, C, D, E, F, G, H, I, J, K, L> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M>(Action<A, B, C, D, E, F, G, H, I, J, K, L, M> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N>(Action<A, B, C, D, E, F, G, H, I, J, K, L, M, N> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O>(Action<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O> method) => Create(method.Target, method.Method);
-		public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P>(Action<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create(Action method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A>(Action<A> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B>(Action<A, B> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C>(Action<A, B, C> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D>(Action<A, B, C, D> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E>(Action<A, B, C, D, E> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F>(Action<A, B, C, D, E, F> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G>(Action<A, B, C, D, E, F, G> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H>(Action<A, B, C, D, E, F, G, H> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I>(Action<A, B, C, D, E, F, G, H, I> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J>(Action<A, B, C, D, E, F, G, H, I, J> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K>(Action<A, B, C, D, E, F, G, H, I, J, K> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L>(Action<A, B, C, D, E, F, G, H, I, J, K, L> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M>(Action<A, B, C, D, E, F, G, H, I, J, K, L, M> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N>(Action<A, B, C, D, E, F, G, H, I, J, K, L, M, N> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O>(Action<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O> method) => Create(method.Target, method.Method);
+		[SecuritySafeCritical] public static DynFunc Create<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P>(Action<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P> method) => Create(method.Target, method.Method);
 		#endregion
 
 		#region Casting and Conversion
@@ -248,6 +432,32 @@ namespace CitizenFX.Core
 			[typeof(double)] = GetMethodInfo<object, double>(Convert.ToDouble),
 			[typeof(decimal)] = GetMethodInfo<object, decimal>(Convert.ToDecimal)
 		};
+
+		#endregion
+
+		/// <summary>
+		/// Returns the original method that's been wrapped or its own <see cref="Delegate.Method"/>
+		/// </summary>
+		/// <param name="dynFunc">this reference</param>
+		/// <returns>The wrapped method or <see cref="Delegate.Method"/> if it wasn't wrapped</returns>
+		[EditorBrowsable(EditorBrowsableState.Never)]
+		public static MethodInfo GetWrappedMethod(this DynFunc dynFunc)
+		{
+			return s_dynfuncMethods.TryGetValue(dynFunc.Method, out var existingMethod) ? existingMethod : dynFunc.Method;
+		}
+
+		#region Helper functions
+
+		internal static string[] ConvertToStringArray(object[] objects)
+		{
+			string[] result = new string[objects.Length];
+			for (int i = 0; i < objects.Length; ++i)
+			{
+				result[i] = objects[i]?.ToString();
+			}
+
+			return result;
+		}
 
 		#endregion
 	}

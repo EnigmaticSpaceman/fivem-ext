@@ -1164,7 +1164,7 @@ static void ReloadMapStore()
 
 #ifdef GTA_FIVE
 	// needs verification for newer builds
-	if (!xbr::IsGameBuildOrGreater<2802 + 1>())
+	if (!xbr::IsGameBuildOrGreater<2944 + 1>())
 	{
 		ReloadMapStoreNative();
 	}
@@ -2835,7 +2835,7 @@ std::unordered_set<std::string> g_streamingSuffixSet;
 static hook::cdecl_stub<void()> _waitUntilStreamerClear([]()
 {
 #ifdef GTA_FIVE
-	return hook::get_call(hook::get_pattern("80 A1 7A 01 00 00 FE 8B EA", 12));
+	return hook::get_call(hook::get_pattern("80 A1 ? 01 00 00 FE 8B EA ", 12));
 #elif IS_RDR3
 	return hook::get_call(hook::get_pattern("80 A3 ? ? ? ? FE 48 8D 0D ? ? ? ? BA FF FF 00 00", 24));
 #endif
@@ -2844,7 +2844,7 @@ static hook::cdecl_stub<void()> _waitUntilStreamerClear([]()
 static hook::cdecl_stub<void(void*)> _resyncStreamers([]()
 {
 #ifdef GTA_FIVE
-	return hook::get_call(hook::get_pattern("80 A1 7A 01 00 00 FE 8B EA", 24));
+	return hook::get_call(hook::get_pattern("80 A1 ? 01 00 00 FE 8B EA ", 24));
 #elif IS_RDR3
 	return hook::get_call(hook::get_pattern("80 A3 ? ? ? ? FE 48 8D 0D ? ? ? ? BA FF FF 00 00", 19));
 #endif
@@ -3191,41 +3191,8 @@ static void LoadVehicleMetaForDlc(CDataFileMgr::DataFile* entry, bool notMapType
 	std::map<int, int> txdRelationships;
 	GetTxdRelationships(txdRelationships);
 
-	// try to guess the amount of entries this meta file has
-	int entryCount = 16;
-
-	{
-		auto stream = vfs::OpenRead(entry->name);
-
-		if (stream.GetRef())
-		{
-			auto text = stream->ReadToEnd();
-			std::string textString{ text.begin(), text.end() };
-
-			std::string substring = "</modelName>";
-
-			// safe margin to start
-			entryCount = 4;
-
-			// more SO code: https://stackoverflow.com/a/5816029
-			textString = substring + textString;
-
-			std::vector<int> z;
-			calc_z(textString, z);
-
-			for (int i = substring.size(); i < textString.size(); ++i)
-			{
-				if (z[i] >= substring.size())
-				{
-					entryCount++;
-				}
-			}
-		}
-	}
-
 	// we use DLC name as hash
 	auto entryHash = HashString(entry->name);
-	g_archetypeFactories->Get(5)->GetOrCreate(entryHash, entryCount);
 
 	overrideTypesHash = true;
 	g_origLoadVehicleMeta(entry, notMapTypes, entryHash);
@@ -3261,6 +3228,20 @@ static void AddVehicleArchetype(fwArchetype* self, uint32_t typesHash)
 	}
 
 	g_origAddArchetype(self, typesHash);
+}
+
+static bool (*g_origParserCreateAndLoadAnyType)(void* self, const char* path, const char* extension, void* parStructure, void* parParsableStructure, void* a6);
+
+static bool ParserCreateAndLoadAnyType(void* self, const char* path, const char* extension, void* parStructure, void* parParsableStructure, void* a6)
+{
+	bool success = g_origParserCreateAndLoadAnyType(self, path, extension, parStructure, parParsableStructure, a6);
+	if (success && overrideTypesHash)
+	{
+		uint32_t entryHash = HashString(path);
+		uint16_t entryCount = *(uint16_t*)(*(char**)parParsableStructure + 8);
+		g_archetypeFactories->Get(5)->GetOrCreate(entryHash, entryCount);
+	}
+	return success;
 }
 
 static void (*g_origUnloadVehicleMeta)(CDataFileMgr::DataFile* entry);
@@ -3342,6 +3323,10 @@ static HookFunction hookFunction([]()
 		location = hook::get_pattern("8B D5 48 8B CE 89 46 18 40 84 FF 74 0A", 0x17);
 		hook::set_call(&g_origAddArchetype, location);
 		hook::call(location, AddVehicleArchetype);
+
+		location = hook::get_pattern("89 55 EC 49 8B D2 48 89 44 24", 11);
+		hook::set_call(&g_origParserCreateAndLoadAnyType, location);
+		hook::call(location, ParserCreateAndLoadAnyType);
 	}
 
 	// unloading wrapper
@@ -3417,8 +3402,8 @@ static HookFunction hookFunction([]()
 #endif
 
 #ifdef GTA_FIVE
-	g_streamingInternals = hook::get_address<void*>(hook::get_pattern("80 A1 7A 01 00 00 FE 8B EA", 20));
-	manifestChunkPtr = hook::get_address<void*>(hook::get_pattern("C7 80 74 01 00 00 02 00 00 00 E8 ? ? ? ? 8B 06", -4));
+	g_streamingInternals = hook::get_address<void*>(hook::get_pattern("80 A1 ? 01 00 00 FE 8B EA ", 20));
+	manifestChunkPtr = hook::get_address<void*>(hook::get_pattern("C7 80 ? 01 00 00 02 00 00 00 E8 ? ? ? ? 8B 06", -4));
 #elif IS_RDR3
 	g_streamingInternals = hook::get_address<void*>(hook::get_pattern("80 A3 ? ? ? ? FE 48 8D 0D ? ? ? ? BA FF FF 00 00", 10));
 	manifestChunkPtr = hook::get_address<void*>(hook::get_pattern<char>("33 C9 E8 ? ? ? ? 48 8D 55 10 89 45 10 48", 17));

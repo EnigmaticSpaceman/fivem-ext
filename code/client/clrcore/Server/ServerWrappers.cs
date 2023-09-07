@@ -6,17 +6,23 @@ using System.Collections.Generic;
 using System.Linq;
 
 #if MONO_V2
+using CitizenFX.Core;
 using static CitizenFX.Server.Native.Natives;
+
+namespace CitizenFX.Server
+{
+	public class Player	: Shared.Player
+	{
+		internal Player(Remote remote)
+		{
+			m_handle = remote.GetPlayerHandle();
+		}
+
 #else
 using static CitizenFX.Core.Native.API;
-#endif
 
 namespace CitizenFX.Core
 {
-#if MONO_V2
-	public class Player	: Shared.Player
-	{
-#else
 	public class Player
 	{
 		private string m_handle;
