@@ -1,9 +1,9 @@
 import { post } from './utils';
 import CONFIG from './config';
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import Suggestions from './Suggestions.vue';
-import MessageV from './Message.vue';
+import Message from './Message.vue';
 import { Suggestion } from './Suggestions';
 
 export interface Message {
@@ -58,12 +58,12 @@ const globalMode: Mode = {
   hidden: true
 };
 
-export default Vue.extend({
+export default defineComponent({
   template: "#app_template",
   name: "app",
   components: {
     Suggestions,
-    MessageV
+    Message
   },
   data() {
     return {
@@ -233,22 +233,26 @@ export default Vue.extend({
       this.oldMessages = [];
       this.oldMessagesIndex = -1;
     },
-    ON_SUGGESTION_ADD({ suggestion }: { suggestion: Suggestion }) {
-      this.removedSuggestions = this.removedSuggestions.filter(a => a !== suggestion.name);
-      const duplicateSuggestion = this.backingSuggestions.find(
-        a => a.name == suggestion.name
-      );
-      if (duplicateSuggestion) {
-        if (suggestion.help || suggestion.params) {
-          duplicateSuggestion.help = suggestion.help || "";
-          duplicateSuggestion.params = suggestion.params || [];
+    ON_SUGGESTION_ADD({ suggestion }: { suggestion: Suggestion | Suggestion[] }) {
+      const suggestions = (Array.isArray(suggestion)) ? suggestion : [ suggestion ];
+
+      for (const suggestion of suggestions) {
+        this.removedSuggestions = this.removedSuggestions.filter(a => a !== suggestion.name);
+        const duplicateSuggestion = this.backingSuggestions.find(
+          a => a.name === suggestion.name
+        );
+        if (duplicateSuggestion) {
+          if (suggestion.help || suggestion.params) {
+            duplicateSuggestion.help = suggestion.help || "";
+            duplicateSuggestion.params = suggestion.params || [];
+          }
+          continue;
         }
-        return;
+        if (!suggestion.params) {
+          suggestion.params = []; //TODO Move somewhere else
+        }
+        this.backingSuggestions.push(suggestion);
       }
-      if (!suggestion.params) {
-        suggestion.params = []; //TODO Move somewhere else
-      }
-      this.backingSuggestions.push(suggestion);
     },
     ON_SUGGESTION_REMOVE({ name }: { name: string }) {
       if (this.removedSuggestions.indexOf(name) <= -1) {
@@ -447,7 +451,7 @@ export default Vue.extend({
     hideInput(canceled = false) {
       setTimeout(() => {
         const input = this.$refs.input as HTMLInputElement;
-        delete input.style.height;
+        input.style.height = 'auto';
       }, 50);
 
       if (canceled) {

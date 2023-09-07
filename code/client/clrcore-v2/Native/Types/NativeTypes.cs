@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
 
 namespace CitizenFX.Core.Native
 {
@@ -10,6 +11,8 @@ namespace CitizenFX.Core.Native
 
 		public static unsafe ulong Val(int v) => *(uint*)&v;
 		public static unsafe ulong Val(uint v) => v;
+		public static unsafe ulong Val(long v) => *(ulong*)&v;
+		public static unsafe ulong Val(ulong v) => v;
 		public static unsafe ulong Val(float v) => *(uint*)&v;
 		public static unsafe ulong Val(double v) => *(ulong*)&v;
 		public static unsafe ulong Val(bool v) => *(byte*)&v;
@@ -58,19 +61,19 @@ namespace CitizenFX.Core.Native
 		public static implicit operator Vector3(NativeVector3 self) => new Vector3(self.x, self.y, self.z);
 	}
 
-	public ref struct InFunc
+	public readonly ref struct InFunc
 	{
 		internal readonly byte[] value;
 		
 		internal InFunc(byte[] funcRef) => value = funcRef;
-		public InFunc(DynFunc del) => value = ReferenceFunctionManager.Create(del);
+		public InFunc(DynFunc del) => value = ReferenceFunctionManager.Create(del).Value;
 		public InFunc(Delegate del) : this(Func.Create(del)) { }
 
 		public static implicit operator InFunc(Delegate func) => new InFunc(func);
 		public static implicit operator InFunc(DynFunc func) => new InFunc(func);
 	}
 
-	public ref struct InPacket
+	public readonly ref struct InPacket
 	{
 		internal readonly byte[] value;
 		public InPacket(object obj) => value = MsgPackSerializer.Serialize(obj);
@@ -78,7 +81,8 @@ namespace CitizenFX.Core.Native
 		public static implicit operator InPacket(object[] obj) => Serialize(obj);
 	}
 
-	public ref struct OutPacket
+	[SecuritySafeCritical]
+	public readonly ref struct OutPacket
 	{
 #pragma warning disable 0649 // this type is reinterpreted i.e.: (OutPacket*)ptr
 		private unsafe readonly byte* data;
@@ -87,48 +91,5 @@ namespace CitizenFX.Core.Native
 
 		public unsafe object Deserialize() => MsgPackDeserializer.Deserialize(data, (long)size);
 		internal unsafe object[] DeserializeArray() => MsgPackDeserializer.DeserializeArray(data, (long)size);
-	}
-
-	public ref struct OutString
-	{
-#pragma warning disable 0649 // this type is reinterpreted i.e.: (OutString*)ptr
-		private unsafe readonly byte* data;
-#pragma warning restore 0649
-
-		/// <summary>
-		/// A managed string that holds a conerted copy of the unmanaged ANSI string. If ptr is null, the method returns a null string.
-		/// </summary>
-		/// <param name="str"></param>
-		[SecuritySafeCritical]
-		public static unsafe implicit operator string(in OutString str) => Marshal.PtrToStringAnsi((IntPtr)str.data);
-
-		/// <summary>
-		/// A managed string that holds a copy of the unmanaged ANSI string. If ptr is null, the method returns a null string.
-		/// </summary>
-		/// <param name="str"></param>
-		[SecuritySafeCritical]
-		public static unsafe implicit operator CString(in OutString str) => CString.Create(str.data);
-
-		/// <summary>
-		/// A managed byte[] that holds a copy of the unmanaged ANSI string. If ptr is null, the method returns a null string.
-		/// </summary>
-		/// <param name="str"></param>
-		[SecuritySafeCritical]
-		public static unsafe implicit operator byte[](in OutString str)
-		{
-			// TODO: PERF: check if moving this to an internal C++ backed function will be faster
-			byte* end = str.data;
-			if (end != null)
-			{
-				for (; *end != 0x0; ++end); // find the end, excluding the '\0'
-				long length = end - str.data;
-
-				byte[] array = new byte[length];
-				Marshal.Copy((IntPtr)str.data, array, 0, (int)length);
-				return array;
-			}
-
-			return null;
-		}
 	}
 }

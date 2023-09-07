@@ -2,6 +2,7 @@
 #include "MonoScriptRuntime.h"
 
 #include "MonoComponentHost.h"
+#include "MonoDomainScope.h"
 #include "MonoFreeable.h"
 
 #include <msgpack.hpp>
@@ -19,6 +20,11 @@
 #include <mono/metadata/exception.h>
 
 /*
+* Notes while working on this environment:
+*  - Scheduling: any function that can potentially add tasks to the C#'s scheduler needs to return the time
+*    of when it needs to be activated again, which then needs to be scheduled in the core scheduler (bookmark).
+*
+*
 * Some notes on mono domain switching (psuedo code):
 * 
 * mono_domain_set(MonoDomain* domain, bool force)  => if (!is_unloading(domain)) mono_domain_set_internal(domain);
@@ -28,10 +34,18 @@
 * We also don't need to do domain != current_domain checks as it's already included in mono_domain_set_internal().
 */
 
-// backwards compatibility, without this the v1 runtime will crash
-static void back_to_root_domain()
+using namespace std::literals; // enable ""sv literals
+
+uint64_t GetCurrentSchedulerTime()
 {
-	mono_domain_set_internal(mono_get_root_domain());
+	// TODO: replace this when the bookmark scheduler follows frame time instead of real time.
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool IsProfiling()
+{
+	static auto profiler = fx::ResourceManager::GetCurrent()->GetComponent<fx::ProfilerComponent>();
+	return profiler->IsRecording();
 }
 
 namespace fx::mono
@@ -82,15 +96,19 @@ result_t MonoScriptRuntime::Create(IScriptHost* host)
 
 		{
 			fx::OMPtr<IScriptHost> ptr(host);
+
 			fx::OMPtr<IScriptHostWithResourceData> resourcePtr;
 			ptr.As(&resourcePtr);
-
 			m_resourceHost = resourcePtr.GetRef();
 
 			fx::OMPtr<IScriptHostWithManifest> manifestPtr;
 			ptr.As(&manifestPtr);
-
 			m_manifestHost = manifestPtr.GetRef();
+
+			fx::OMPtr<IScriptHostWithBookmarks> bookmarkPtr;
+			ptr.As(&bookmarkPtr);
+			m_bookmarkHost = bookmarkPtr.GetRef();
+			m_bookmarkHost->CreateBookmarks(this);
 		}
 
 		char* resourceName = nullptr;
@@ -116,7 +134,9 @@ result_t MonoScriptRuntime::Create(IScriptHost* host)
 		auto* thisPtr = this;
 		MonoException* exc;
 		auto initialize = Method::Find(image, "CitizenFX.Core.ScriptInterface:Initialize");
-		initialize({ mono_string_new(MonoComponentHost::GetRootDomain(), resourceName), &thisPtr, &m_instanceId }, &exc);
+		initialize({ mono_string_new(m_appDomain, resourceName), &thisPtr, &m_instanceId }, &exc);
+
+		mono_domain_set_internal(mono_get_root_domain()); // back to root for v1
 
 		return ReturnOrError(exc);
 	}
@@ -143,22 +163,26 @@ void MonoScriptRuntime::InitializeMethods(MonoImage* image)
 
 result_t MonoScriptRuntime::Destroy()
 {
-	mono_domain_set_internal(MonoComponentHost::GetRootDomain()); // not doing this crashes the unloading of this app domain
-	mono_domain_unload(m_appDomain);
+	// Technically we do not need to change domain as long as we're not on the one we unload.
+	// It's purely used to set it back to by mono, but for now we do it to be 100% sure.
+	mono_domain_set_internal(MonoComponentHost::GetRootDomain());
+
+	MonoException* exc = nullptr;
+	mono_domain_try_unload(m_appDomain, (MonoObject**)&exc);
 
 	m_appDomain = nullptr;
 	m_scriptHost = nullptr;
+	m_bookmarkHost->RemoveBookmarks(this);
+	m_bookmarkHost = nullptr;
 
-	back_to_root_domain();
+	mono_domain_set_internal(mono_get_root_domain()); // back to root for v1
 
-	return FX_S_OK;
+	return ReturnOrError(exc);
 }
 
-result_t MonoScriptRuntime::Tick()
+result_t MonoScriptRuntime::TickBookmarks(uint64_t* bookmarks, int32_t numBookmarks)
 {
-	static auto profiler = fx::ResourceManager::GetCurrent()->GetComponent<fx::ProfilerComponent>();
-
-	// m_handler->PushRuntime(static_cast<IScriptRuntime*>(this));
+	m_handler->PushRuntime(static_cast<IScriptRuntime*>(this));
 	if (m_parentObject)
 		m_parentObject->OnActivate();
 
@@ -166,16 +190,20 @@ result_t MonoScriptRuntime::Tick()
 
 	MONO_BOUNDARY_START
 
+	// reset scheduled time, nextTick will set the next time
+	m_scheduledTime = ~uint64_t(0);
+
 	MonoException* exc;
-	m_tick(profiler->IsRecording(), &exc);
+	uint64_t nextTick = m_tick(GetCurrentSchedulerTime(), IsProfiling(), &exc);
+	ScheduleTick(nextTick);
 
 	MONO_BOUNDARY_END
 
-	// m_handler->PopRuntime(static_cast<IScriptRuntime*>(this));
+	m_handler->PopRuntime(static_cast<IScriptRuntime*>(this));
 	if (m_parentObject)
 		m_parentObject->OnDeactivate();
 
-	back_to_root_domain();
+	mono_domain_set_internal(mono_get_root_domain()); // v1 requires us to be on the root domain
 
 	return ReturnOrError(exc);
 }
@@ -183,16 +211,18 @@ result_t MonoScriptRuntime::Tick()
 result_t MonoScriptRuntime::TriggerEvent(char* eventName, char* argsSerialized, uint32_t serializedSize, char* sourceId)
 {
 	fx::PushEnvironment env(this);
-	mono_domain_set_internal(m_appDomain);
+	MonoDomainScope scope(m_appDomain);
 
 	MONO_BOUNDARY_START
 
 	MonoException* exc = nullptr;
-	m_triggerEvent(mono_string_new(MonoComponentHost::GetRootDomain(), eventName), argsSerialized, serializedSize, mono_string_new(MonoComponentHost::GetRootDomain(), sourceId), &exc);
+	uint64_t nextTick = m_triggerEvent(mono_string_new(m_appDomain, eventName),
+		argsSerialized, serializedSize, mono_string_new(m_appDomain, sourceId),
+		GetCurrentSchedulerTime(), IsProfiling(), &exc);
+
+	ScheduleTick(nextTick);
 
 	MONO_BOUNDARY_END
-
-	back_to_root_domain();
 
 	return ReturnOrError(exc);
 }
@@ -216,14 +246,71 @@ int MonoScriptRuntime::GetInstanceId()
 
 int MonoScriptRuntime::HandlesFile(char* filename, IScriptHostWithResourceData* metadata)
 {
-	int enableV2 = 0;
-	metadata->GetNumResourceMetaData(const_cast<char*>("mono_rt2"), &enableV2); // should've been const qualified
+	int monoRT2FlagCount = 0;
+	metadata->GetNumResourceMetaData(const_cast<char*>("mono_rt2"), &monoRT2FlagCount); // should've been const qualified
 
-	if (enableV2 > 0)
+	// check if mono_rt2 has been set
+	if (monoRT2FlagCount == 0)
 	{
-		size_t size = strlen(filename);
-		return size > 8 && memcmp(filename + size - 8, ".net.dll", 8) == 0;
+		return false;
 	}
+
+	// check if file ends with .net.dll
+	size_t size = strlen(filename);
+	if (size <= 8 || strncmp(filename + size - 8, ".net.dll", 8) != 0)
+	{
+		return false;
+	}
+
+	// last supported date for this pilot of mono_rt2, in UTC
+	constexpr int maxYear = 2023, maxMonth = 8, maxDay = 31;
+
+	// Allowed values for mono_rt2
+	constexpr std::string_view allowedValues[] = {
+		// put latest on top, right here ↓
+		"Prerelease expiring 2023-08-31. See https://aka.cfx.re/mono-rt2-preview for info."sv,
+		"Prerelease expiring 2023-06-30. See https://aka.cfx.re/mono-rt2-preview for info."sv,
+	};
+
+	// disable loading mono_rt2 scripts after maxYear-maxMonth-maxDay
+	tm maxDate;
+	memset(&maxDate, 0, sizeof(maxDate));
+	maxDate.tm_year = maxYear - 1900; // YYYY - 1900 (starts from 1900)
+	maxDate.tm_mon = maxMonth - 1;    // 0 .. 11
+	maxDate.tm_mday = maxDay;         // 1 .. 31
+
+	std::time_t currentTime = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+	std::time_t endTime = mktime(&maxDate) + std::time_t(24 * 60 * 60); // until the end of the day
+
+	if (currentTime > endTime)
+	{
+		console::PrintError(_CFX_NAME_STRING(_CFX_COMPONENT_NAME), "mono_rt2 is no longer supported since (%04d-%02d-%02d), skipped loading %s.\n",
+			maxYear, maxMonth, maxDay, filename);
+
+		return false;
+	}
+
+	// date & sentence restrictions on mono_rt2 flag, only allow loading if the value is in our array
+	for (int i = 0; i < monoRT2FlagCount; ++i)
+	{
+		const char* flagValue = nullptr;
+
+		// TODO: fix ill formed and/or unclear usage of non-const char* parameters
+		if (FX_SUCCEEDED(metadata->GetResourceMetaData(const_cast<char*>("mono_rt2"), i, const_cast<char**>(&flagValue))))
+		{
+			for (auto& value : allowedValues)
+			{
+				if (value == flagValue)
+				{
+					return true;
+				}
+			}
+		}
+	}
+
+	console::PrintError(_CFX_NAME_STRING(_CFX_COMPONENT_NAME), "mono_rt2 was requested for file %s but the value is missing or not accepted.\n"
+		"\tTo continue using mono_rt2 please update your fxmanifest to:\n"
+		"\tmono_rt2 '%s'\n", filename, allowedValues[0]);
 
 	return false;
 }
@@ -232,12 +319,19 @@ result_t MonoScriptRuntime::LoadFile(char* scriptFile)
 {
 	fx::PushEnvironment env(this);
 	MonoComponentHost::EnsureThreadAttached();
-	mono_domain_set_internal(m_appDomain);
+	MonoDomainScope scope(m_appDomain);
+
+	auto currentTime = GetCurrentSchedulerTime();
+	bool isProfiling = IsProfiling();
 
 	MonoException* exc = nullptr;
-	m_loadAssembly({ mono_string_new(MonoComponentHost::GetRootDomain(), scriptFile) }, &exc);
-
-	mono_domain_set_internal(MonoComponentHost::GetRootDomain());
+	MonoObject* nextTickObject = m_loadAssembly({ mono_string_new(m_appDomain, scriptFile), &currentTime, &isProfiling }, &exc);
+	uint64_t nextTick = *reinterpret_cast<uint64_t*>(mono_object_unbox(nextTickObject));
+	ScheduleTick(nextTick);
+	
+	console::PrintWarning(_CFX_NAME_STRING(_CFX_COMPONENT_NAME),
+		"Assembly %s has been loaded into the mono rt2 runtime. This runtime is still in beta and shouldn't be used in production, "
+		"crashes and breaking changes are to be expected.\n", scriptFile);
 
 	return ReturnOrError(exc);
 }
@@ -249,12 +343,11 @@ result_t MonoScriptRuntime::CallRef(int32_t refIndex, char* argsSerialized, uint
 
 	fx::PushEnvironment env(this);
 	MonoComponentHost::EnsureThreadAttached();
-	mono_domain_set_internal(m_appDomain);
+	MonoDomainScope scope(m_appDomain);
 
 	MonoException* exc = nullptr;
-	m_callRef(refIndex, argsSerialized, argsSize, retvalSerialized, retvalSize, &exc);
-
-	back_to_root_domain();
+	uint64_t nextTick = m_callRef(refIndex, argsSerialized, argsSize, retvalSerialized, retvalSize, GetCurrentSchedulerTime(), IsProfiling(), &exc);
+	ScheduleTick(nextTick);
 
 	return ReturnOrError(exc);
 }
@@ -263,12 +356,10 @@ result_t MonoScriptRuntime::DuplicateRef(int32_t refIndex, int32_t* newRefIdx)
 {
 	fx::PushEnvironment env(this);
 	MonoComponentHost::EnsureThreadAttached();
-	mono_domain_set_internal(m_appDomain);
+	MonoDomainScope scope(m_appDomain);
 
 	MonoException* exc = nullptr;
 	m_duplicateRef(refIndex, newRefIdx, &exc);
-
-	back_to_root_domain();
 
 	return ReturnOrError(exc);
 }
@@ -277,12 +368,10 @@ result_t MonoScriptRuntime::RemoveRef(int32_t refIndex)
 {
 	fx::PushEnvironment env(this);
 	MonoComponentHost::EnsureThreadAttached();
-	mono_domain_set_internal(m_appDomain);
+	MonoDomainScope scope(m_appDomain);
 
 	MonoException* exc = nullptr;
 	m_removeRef(refIndex, &exc);
-
-	back_to_root_domain();
 
 	return ReturnOrError(exc);
 }
@@ -293,7 +382,7 @@ MonoArray* MonoScriptRuntime::CanonicalizeRef(int referenceId) const
 	result_t hr = m_scriptHost->CanonicalizeRef(referenceId, m_instanceId, &str);
 	size_t size = strlen(str) + 1; // also get and copy '\0'
 
-	MonoArray* arr = mono_array_new(MonoComponentHost::GetRootDomain(), mono_get_byte_class(), size);
+	MonoArray* arr = mono_array_new(m_appDomain, mono_get_byte_class(), size);
 	memcpy(mono_array_addr_with_size(arr, 1, 0), str, size);
 
 	fwFree(str);
@@ -309,11 +398,9 @@ result_t MonoScriptRuntime::RequestMemoryUsage()
 result_t MonoScriptRuntime::GetMemoryUsage(int64_t* memoryUsage)
 {
 	MonoComponentHost::EnsureThreadAttached();
-	mono_domain_set_internal(m_appDomain);
+	MonoDomainScope scope(m_appDomain);
 
 	*memoryUsage = MonoComponentHostShared::GetMemoryUsage();
-
-	back_to_root_domain();
 
 	return FX_S_OK;
 }
@@ -336,14 +423,12 @@ result_t MonoScriptRuntime::SetupFxProfiler(void* obj, int32_t resourceId)
 {
 	fx::PushEnvironment env(this);
 	MonoComponentHost::EnsureThreadAttached();
-	mono_domain_set_internal(m_appDomain);
+	MonoDomainScope scope(MonoComponentHost::GetRootDomain());
 
 	trace("begin m_startProfiling\n");
 	MonoException* exc = nullptr;
 	m_startProfiling(&exc);
 	trace("end m_startProfiling\n");
-
-	back_to_root_domain();
 
 	return ReturnOrError(exc);
 }
@@ -352,14 +437,12 @@ result_t MonoScriptRuntime::ShutdownFxProfiler()
 {
 	fx::PushEnvironment env(this);
 	MonoComponentHost::EnsureThreadAttached();
-	mono_domain_set_internal(m_appDomain);
+	MonoDomainScope scope(MonoComponentHost::GetRootDomain());
 
 	trace("begin m_stopProfiling\n");
 	MonoException* exc = nullptr;
 	m_stopProfiling(&exc);
 	trace("end m_stopProfiling\n");
-
-	back_to_root_domain();
 
 	return ReturnOrError(exc);
 }
@@ -382,7 +465,7 @@ bool MonoScriptRuntime::ReadAssembly(MonoString* name, MonoArray** assembly, Mon
 			uint32_t read;
 
 			stream->GetLength(&length);
-			*assembly = mono_array_new(MonoComponentHost::GetRootDomain(), mono_get_byte_class(), length);
+			*assembly = mono_array_new(m_appDomain, mono_get_byte_class(), length);
 			hr = stream->Read(mono_array_addr_with_size(*assembly, sizeof(char), 0), length, &read);
 
 			stream.ReleaseAndGetAddressOf();
@@ -404,7 +487,7 @@ bool MonoScriptRuntime::ReadAssembly(MonoString* name, MonoArray** assembly, Mon
 			uint32_t read;
 
 			stream->GetLength(&length);
-			*symbols = mono_array_new(MonoComponentHost::GetRootDomain(), mono_get_byte_class(), length);
+			*symbols = mono_array_new(m_appDomain, mono_get_byte_class(), length);
 			stream->Read(mono_array_addr_with_size(*symbols, sizeof(char), 0), length, &read);
 		}
 

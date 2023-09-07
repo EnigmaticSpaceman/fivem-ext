@@ -1,17 +1,16 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Threading;
 
 namespace CitizenFX.Core
 {
-	static class ReferenceFunctionManager
+	internal static class ReferenceFunctionManager
 	{
-		internal struct Function
+		internal class Function
 		{
-			public readonly DynFunc m_method;
+			public DynFunc m_method;
 			public readonly byte[] m_refId;
 			public int m_refCount;
 
@@ -28,10 +27,17 @@ namespace CitizenFX.Core
 		private static IntPtr m_retvalBuffer;
 		private static int m_retvalBufferSize;
 
-		// don't alter the returned value
+		/// <summary>
+		/// Register a delegate to other runtimes and/or our host (reference function)
+		/// </summary>
+		/// <param name="method">Delagate to register to the external world</param>
+		/// <returns>( internalReferenceId, externalReferenceId )</returns>
+		/// <remarks>Don't alter the returned value</remarks>
 		[SecuritySafeCritical]
-		public static byte[] Create(DynFunc method)
+		internal static KeyValuePair<int, byte[]> Create(DynFunc method)
 		{
+			// TODO: change return type to `ValueTuple` once clients support those
+
 			int id = method.Method.GetHashCode();
 
 			// keep incrementing until we find a free spot
@@ -41,10 +47,10 @@ namespace CitizenFX.Core
 			byte[] refId = ScriptInterface.CanonicalizeRef(id);
 			s_references[id] = new Function(method, refId);
 
-			return refId;
+			return new KeyValuePair<int, byte[]>(id, refId);
 		}
 
-		public static int Duplicate(int reference)
+		internal static int IncrementReference(int reference)
 		{
 			if (s_references.TryGetValue(reference, out var funcRef))
 			{
@@ -55,13 +61,63 @@ namespace CitizenFX.Core
 			return -1;
 		}
 
-		public static void Remove(int reference)
+		internal static void DecrementReference(int reference)
 		{
 			if (s_references.TryGetValue(reference, out var funcRef)
 				&& Interlocked.Decrement(ref funcRef.m_refCount) <= 0)
 			{
 				s_references.Remove(reference);
 			}
+		}
+
+		/// <summary>
+		/// Remove reference function by id
+		/// </summary>
+		/// <param name="referenceId">Internal reference id of the reference to remove</param>
+		internal static void Remove(int referenceId)
+		{			
+			s_references.Remove(referenceId);
+		}
+
+		/// <summary>
+		/// Remove all reference functions that are targeting a specific object
+		/// </summary>
+		/// <remarks>Slow, may need to be replaced</remarks>
+		/// <param name="target"></param>
+		internal static void RemoveAllWithTarget(object target)
+		{
+			foreach (var entry in s_references)
+			{
+				if (entry.Value.m_method.Target == target)
+				{
+					s_references.Remove(entry.Key);
+				}
+			}
+		}
+
+		/// <summary>
+		/// Set reference function to another delegate
+		/// </summary>
+		/// <param name="referenceId">Reference id of the reference to remove</param>
+		/// <param name="newFunc">New delegate/method to set the reference function to</param>
+		/// <returns><see langword="true"/> if found and changed, <see langword="false"/> otherwise</returns>
+		internal static bool SetDelegate(int referenceId, DynFunc newFunc)
+		{
+			if (s_references.TryGetValue(referenceId, out var refFunc))
+			{
+				refFunc.m_method = newFunc;
+				return true;
+			}
+
+			return false;
+		}
+
+		internal static int CreateCommand(string command, DynFunc method, bool isRestricted)
+		{
+			var registration = Create(method);
+			Native.CoreNatives.RegisterCommand(command, new Native.InFunc(registration.Value), isRestricted);
+
+			return registration.Key;
 		}
 
 		[SecurityCritical]
@@ -104,7 +160,7 @@ namespace CitizenFX.Core
 		}
 
 		[SecurityCritical]
-		public unsafe static byte[] Invoke(int reference, byte* arguments, uint argsSize)
+		internal unsafe static byte[] Invoke(int reference, byte* arguments, uint argsSize)
 		{
 			if (s_references.TryGetValue(reference, out var funcRef))
 			{
@@ -119,29 +175,38 @@ namespace CitizenFX.Core
 				}
 				catch (Exception ex)
 				{
-					string argsString = string.Join<string>(", ", args.Select(a => a is null ? "null" : a.GetType().ToString()));
-					Debug.PrintError(ex, $"handling function reference: {funcRef.m_method.Method.Name}\n\twith arguments: ({argsString})");
+					Debug.WriteException(ex, funcRef.m_method, args, "reference function");
 				}
 
 				if (result is Coroutine coroutine)
 				{
 					if (coroutine.IsCompleted)
 					{
-						if (coroutine.GetResult() is Callback callback)
-							coroutine.ContinueWith(() => callback(coroutine.GetResult(), coroutine.Exception));
-						else
-							return MsgPackSerializer.Serialize(new[] { coroutine.GetResult() });
+						if (coroutine.Exception != null)
+						{
+							Debug.Write(coroutine.Exception);
+						}
+
+						return MsgPackSerializer.Serialize(new[] { coroutine.GetResultNonThrowing(), coroutine.Exception?.ToString() });
 					}
 					else
 					{
-						var returnDictionary = new Dictionary<string, object>(1);
-						returnDictionary.Add("__cfx_async_retval", new Action<Callback>(asyncResult =>
-							{
-								coroutine.ContinueWith(new Action(() => asyncResult(coroutine.GetResult(), coroutine.Exception)));
-							})
-						);
+						var returnDictionary = new Dictionary<string, object>()
+						{
+							{ "__cfx_async_retval", new Action<Callback>(asyncResult =>
+								coroutine.ContinueWith(() =>
+								{
+									if (coroutine.Exception != null)
+									{
+										Debug.Write(coroutine.Exception);
+									}
 
-						return MsgPackSerializer.Serialize(new[] { returnDictionary });
+									asyncResult(coroutine.GetResultNonThrowing(), coroutine.Exception?.ToString());
+								}))
+							}
+						};
+
+						return MsgPackSerializer.Serialize(new object[] { returnDictionary });
 					}
 				}
 

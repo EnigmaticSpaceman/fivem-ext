@@ -587,6 +587,28 @@ static int GetCacheLineSizeHook()
 	return rv;
 }
 
+static bool (*g_origRTTI_IsTypeOf_pgBase)(void*);
+
+static bool RTTI_IsTypeOf_pgBase(void* self)
+{
+	if (!self)
+	{
+		return true;
+	}
+
+	return g_origRTTI_IsTypeOf_pgBase(self);
+}
+
+static bool (*g_origFwClipset_GetClipItem_Caller)(void*, unsigned int);
+static bool fwClipset_GetClipItem_Caller(void* moveTask, unsigned int a2 /*'2'*/)
+{
+	if (!moveTask)
+	{
+		return false;
+	}
+	return g_origFwClipset_GetClipItem_Caller(moveTask, a2);
+}
+
 static HookFunction hookFunction{[] ()
 {
 	// CModelInfoStreamingModule LookupModelId null return
@@ -1225,6 +1247,7 @@ static HookFunction hookFunction{[] ()
 
 	// don't fastfail from game CRT code
 	{
+		// 5 hits on 2944, but skipping 2 last
 		auto pattern = hook::pattern("B9 ? ? ? ? CD 29").count_hint(3);
 
 		for (size_t i = 0; i < pattern.size(); i++)
@@ -1234,8 +1257,8 @@ static HookFunction hookFunction{[] ()
 		}
 	}
 
-	// fix crash caused by lack of nullptr check for CWeaponInfo, introduced as a R* bug in 2545
-	if (xbr::IsGameBuildOrGreater<2545>())
+	// fix crash caused by lack of nullptr check for CWeaponInfo, introduced as a R* bug in 2545.0, fixed in 2628.2
+	if (xbr::IsGameBuildOrGreater<2545>() && !xbr::IsGameBuildOrGreater<2628>())
 	{
 		auto location = hook::get_pattern("41 81 7F 10 F3 9C CD 45");
 
@@ -1272,5 +1295,103 @@ static HookFunction hookFunction{[] ()
 		patchStub.Init(reinterpret_cast<intptr_t>(location));
 		hook::nop(location, 8);
 		hook::jump(location, patchStub.GetCode());
+	}
+
+	//
+	// Null pointer dereferencing crash fix in rage::strRequestMgr::RemoveObject. The function
+	// that is getting patched used to ensure that first argument is a type of rage::pgBase.
+	// However it also return false if a nullptr has been passed, this is why the crash is happening.
+	// The code inside if-check does expect variable to be a valid pointer. We're patching this
+	// specific RTTI type checking function call to return "true" when first argument is nullptr.
+	// This is also clear that first argument may be a nullptr given the other related code in this function.
+	//
+	if (xbr::IsGameBuildOrGreater<2802>())
+	{
+		auto location = hook::get_pattern("B9 D4 A7 C6 36 E8", -19);
+		hook::set_call(&g_origRTTI_IsTypeOf_pgBase, location);
+		hook::call(location, RTTI_IsTypeOf_pgBase);
+	}
+
+	// netBlender::addOrientationFrame()
+	// Sometime before 1604, Extra logic related to vehicles was added.
+	// This seems to cause a crash in some cases where the object is already destructed
+	if (xbr::IsGameBuildOrGreater<1604>())
+	{
+		auto location = hook::get_pattern("48 8D 54 24 30 89 81 ? 01 00 00");
+		// NOP loading Vector3 Ref into RDX for the below function
+		hook::nop(location, 5);
+		// NOP the function call that was added
+		hook::nop((char*)location + 21, 6);
+		// NOP the extra comparisons added to the if()
+		hook::nop((char*)location + 0x69, 45);
+		// Change the opcode to an unconditional JMP
+		hook::put((char*)location + 0x96, (uint8_t)0xEB);
+	}
+
+	// Caller to rage::fwClipset::GetClipItem()
+	// GetClipItem() will immediately deref a1+50
+	// This can be NULL in some cases, and in other places the game is seen checking if it's NULL
+	{
+		// Sig to start of function [1604-2944]
+		MH_Initialize();
+		MH_CreateHook(hook::get_pattern("48 8B C4 48 89 58 10 48 89 68 18 48 89 70 20 57 48 83 EC 20 8B EA"), fwClipset_GetClipItem_Caller, (void**)&g_origFwClipset_GetClipItem_Caller);
+		MH_EnableHook(MH_ALL_HOOKS);
+	}
+
+	// CNetObjAutomobile::sub_1410FC878() [2699]
+	// in the 2nd half of the function, there is some code that deals with the vehicle intelligence tasktree
+	// however, the VehicleIntelligence (CVehicle+0xBD0) seems to be NULL in some cases -- it is deref'd CVehicle->Intelligence->tasktree without checking
+	{
+		// 48 8B 4E 50      mov     rcx, [rsi+50h]
+		// 48 85 C9         test    rcx, rcx
+		// 74 76            jz      short loc_1410FC94C
+		void* location = hook::get_pattern("48 8B 4E 50 48 85 C9 74 ? 48 8B 81 ? ? 00 00");
+
+		uint8_t jzToFailBytes = *(uint8_t*)((uintptr_t)location + 8);
+		void* jzFailLocation = (void*)((uintptr_t)location + 9 + jzToFailBytes);
+
+		int offsetToIntel = *(int*)((uintptr_t)location + 12);
+
+		static struct : jitasm::Frontend
+		{
+			intptr_t location;
+			intptr_t retSuccess;
+			intptr_t retFail;
+			int offsetToIntelligence;
+
+			void Init(intptr_t location, intptr_t failLocation, int offsetToIntel)
+			{
+				this->location = location;
+				this->retSuccess = location + 9;
+				this->retFail = failLocation;
+				this->offsetToIntelligence = offsetToIntel;
+			}
+
+			void InternalMain() override
+			{
+				// original code
+				// Get gameObj from CNetObj
+				mov(rcx, qword_ptr[rsi + 0x50]);
+				test(rcx, rcx);
+				jz("fail");
+				
+				// also test for gameObj->Intelligence
+				mov(rax, qword_ptr[rcx + offsetToIntelligence]);
+				test(rax, rax);
+				jz("fail");
+
+				mov(rax, retSuccess);
+				jmp(rax);
+
+				L("fail");
+				mov(rax, retFail);
+				jmp(rax);
+			}
+		} intelCheckStub;
+
+		intelCheckStub.Init(reinterpret_cast<intptr_t>(location), reinterpret_cast<intptr_t>(jzFailLocation), offsetToIntel);
+		hook::nop(location, 9);
+		intelCheckStub.Assemble();
+		hook::jump(location, intelCheckStub.GetCode());
 	}
 }};

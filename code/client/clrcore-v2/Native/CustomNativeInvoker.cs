@@ -11,6 +11,7 @@ using ContextType = CitizenFX.Core.RageScriptContext;
 
 namespace CitizenFX.Core.Native
 {
+	[SecuritySafeCritical]
 	public static class CustomNativeInvoker
 	{
 
@@ -28,6 +29,7 @@ namespace CitizenFX.Core.Native
 			/// Keeps adding arguments onto the argument stack, will recurse when arguments need to be fixed.
 			/// This approach is 10x faster than the v1 approach in combination with CString
 			/// </summary>
+			[SecurityCritical]
 			internal unsafe void PushPinAndInvoke()
 			{
 				while (m_offset < m_length)

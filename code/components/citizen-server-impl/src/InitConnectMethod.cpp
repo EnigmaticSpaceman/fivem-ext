@@ -704,7 +704,17 @@ static InitFunction initFunction([]()
 
 					for (const auto& [ key, value ] : deferrals->GetHandoverData())
 					{
-						handoverData[key] = json::parse(value);
+						std::vector<char> handoverValue;
+						utf8::replace_invalid(value.begin(), value.end(), std::back_inserter(handoverValue));
+
+						try
+						{
+							handoverData[key] = json::parse(handoverValue);
+						}
+						catch (std::exception&)
+						{
+
+						}
 					}
 
 					data["handover"] = std::move(handoverData);

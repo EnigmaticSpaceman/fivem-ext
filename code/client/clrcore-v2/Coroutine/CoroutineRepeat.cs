@@ -3,43 +3,59 @@ using System;
 namespace CitizenFX.Core
 {	internal class CoroutineRepeat
 	{
+		enum Status
+		{
+			Stopped,
+			Active,
+			Stopping,
+		}
+
 		public Func<Coroutine> m_coroutine;
+		public bool m_stopOnException;
 
-		public bool IsRepeating { get; set; } = true;
+		private Status m_status = Status.Stopped;
 
-		public CoroutineRepeat(Func<Coroutine> coroutine)
+		public CoroutineRepeat(Func<Coroutine> coroutine, bool stopOnException)
 		{
 			m_coroutine = coroutine;
+			m_stopOnException = stopOnException;
 		}
 
 		public void Schedule()
 		{
-			IsRepeating = true;
+			Status curStatus = m_status;
+			m_status = Status.Active;
 
-			// Create a repeating action
-			Action action = null;
-			action = () =>
+			if (curStatus == Status.Stopped)
 			{
-				var result = m_coroutine();
-				if (result != null && !result.GetAwaiter().IsCompleted)
-				{
-					result.GetAwaiter().OnCompleted(() =>
-					{
-						if (IsRepeating)
-						{
-							Scheduler.Schedule(action);
-						}
-					});
-				}
-				else if (IsRepeating)
-				{
-					Scheduler.Schedule(action);
-				}
-			};
-
-			Scheduler.Schedule(action);
+				Scheduler.Schedule(Execute);
+			}
 		}
 
-		public void Stop() => IsRepeating = false;
+		private async void Execute()
+		{
+			while (m_status == Status.Active)
+			{
+				try
+				{
+					await m_coroutine();
+				}
+				catch (Exception ex)
+				{
+					Debug.WriteLine(ex);
+
+					if (m_stopOnException)
+					{
+						break;
+					}
+				}
+
+				await Coroutine.Yield();
+			}
+
+			m_status = Status.Stopped;
+		}
+
+		public void Stop() => m_status = Status.Stopping;
 	}
 }
